@@ -1,34 +1,34 @@
-from datetime import datetime, timedelta
-from security.behavior_monitor import monitor_behavior
+from security.decision_engine import make_decision
 
-start = datetime(2026, 10, 7, 10, 0, 0)
+# Building blocks for the test cases
+no_policy = {"decision": "NO_MATCH", "reason": "No enabled policy matched this request"}
+low = {"risk_score": 5, "risk_level": "LOW"}
+medium = {"risk_score": 40, "risk_level": "MEDIUM"}
+high = {"risk_score": 78, "risk_level": "HIGH"}
+no_threat = {"threat_detected": False}
+no_behavior = {"unusual_behavior": False}
 
-def entry(seconds, action, resource, decision="ALLOW"):
-    return {"timestamp": start + timedelta(seconds=seconds),
-            "action": action, "resource": resource, "decision": decision}
+def show(title, result):
+    print(f"{title:35} -> {result['decision']:7} ({result['rule']})")
 
-# 1. Normal behavior
-normal = [entry(i * 30, "READ_FILE", "public_research.pdf") for i in range(4)]
-print(monitor_behavior(normal))
-
-# 2. Too many actions in a short period (25 actions in 25 seconds)
-burst = [entry(i, "READ_FILE", "public_research.pdf") for i in range(25)]
-print(monitor_behavior(burst))
-
-# 3. Repeated denied actions
-denied = [entry(i * 10, "READ_DATABASE", "employee_salary", "BLOCK") for i in range(3)]
-print(monitor_behavior(denied))
-
-# 4. Suspicious sequence
-sequence = [
-    entry(0, "READ_DATABASE", "employee_records"),
-    entry(10, "EXPORT_DATA", "employee_records"),
-    entry(20, "SEND_EMAIL", "external_address"),
-]
-print(monitor_behavior(sequence))
-
-# 5. Unusual resource for this agent
-print(monitor_behavior(normal, usual_resources={"research_notes.pdf"}))
-
-# 6. Empty history
-print(monitor_behavior([]))
+show("1. Clean request",
+     make_decision(True, no_policy, low, no_threat, no_behavior))
+show("2. No permission",
+     make_decision(False, no_policy, low, no_threat, no_behavior))
+show("3. Policy BLOCK",
+     make_decision(True, {"decision": "BLOCK", "reason": "Matched policy X"}, low, no_threat, no_behavior))
+show("4. High-severity threat",
+     make_decision(True, no_policy, low,
+                   {"threat_detected": True, "threat_type": "PROMPT_INJECTION",
+                    "severity": "HIGH", "description": "Override attempt"}, no_behavior))
+show("5. Risk HIGH",
+     make_decision(True, no_policy, high, no_threat, no_behavior))
+show("6. Risk MEDIUM",
+     make_decision(True, no_policy, medium, no_threat, no_behavior))
+show("7. Policy REVIEW, low risk",
+     make_decision(True, {"decision": "REVIEW", "reason": "Matched policy Y"}, low, no_threat, no_behavior))
+show("8. HR export: policy REVIEW + risk HIGH",
+     make_decision(True, {"decision": "REVIEW", "reason": "Matched policy Y"}, high, no_threat, no_behavior))
+show("9. Unusual behavior HIGH",
+     make_decision(True, no_policy, low, no_threat,
+                   {"unusual_behavior": True, "severity": "HIGH", "reason": "Repeated denials"}))
