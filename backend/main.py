@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from backend import models  # must be imported so the tables are registered on Base
 from backend.config import APP_NAME, APP_VERSION
 from backend.database import Base, engine
+from backend.routes import actions
 
 
 # Runs once when the application starts: creates any missing tables
@@ -15,6 +16,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
+
+app.include_router(actions.router)
 
 
 @app.get("/")

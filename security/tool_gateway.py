@@ -2,6 +2,7 @@ import uuid
 
 from sqlalchemy.orm import Session
 
+from agents import tools  # the ONLY place in the project that should import the tools
 from backend.models import (
     Agent, Resource, ActionRequest, AuditLog, RiskEvent, SecurityIncident,
     Permission, AgentPermission, utc_now,
@@ -27,33 +28,43 @@ DATA_MOVING_ACTIONS = {"SEND_EMAIL", "EXPORT_DATA"}
 HISTORY_LIMIT = 50
 
 
-# ---------- Simulated tools (nothing real is touched) ----------
-def tool_read_file(resource, destination):
-    return f"[SIMULATED] Read file '{resource}'"
+# ---------- Tool connections ----------
+# Each runner turns the gateway's values into the arguments the matching
+# simulated tool in agents/tools.py expects.
+# payload holds optional tool-specific data (record, subject, body). It is only
+# passed to the tool and is NEVER used by the security checks.
+
+def run_read_file(resource, destination, payload):
+    return tools.read_file(resource)
 
 
-def tool_read_database(resource, destination):
-    return f"[SIMULATED] Read records from '{resource}'"
+def run_read_database(resource, destination, payload):
+    return tools.read_database(resource)
 
 
-def tool_write_database(resource, destination):
-    return f"[SIMULATED] Wrote records to '{resource}'"
+def run_write_database(resource, destination, payload):
+    return tools.write_database(resource, payload.get("record", "(no record supplied)"))
 
 
-def tool_send_email(resource, destination):
-    return f"[SIMULATED] Sent '{resource}' by email to {destination}"
+def run_send_email(resource, destination, payload):
+    return tools.send_email(
+        destination or "(no recipient)",
+        payload.get("subject", resource),
+        payload.get("body", ""),
+    )
 
 
-def tool_export_data(resource, destination):
-    return f"[SIMULATED] Exported '{resource}' to {destination}"
+def run_export_data(resource, destination, payload):
+    return tools.export_data(resource, destination or "(no destination)")
 
 
-TOOLS = {
-    "READ_FILE": tool_read_file,
-    "READ_DATABASE": tool_read_database,
-    "WRITE_DATABASE": tool_write_database,
-    "SEND_EMAIL": tool_send_email,
-    "EXPORT_DATA": tool_export_data,
+# Maps an action name to the function that runs its simulated tool
+TOOL_RUNNERS = {
+    "READ_FILE": run_read_file,
+    "READ_DATABASE": run_read_database,
+    "WRITE_DATABASE": run_write_database,
+    "SEND_EMAIL": run_send_email,
+    "EXPORT_DATA": run_export_data,
 }
 
 
@@ -110,22 +121,26 @@ def block_early(db, agent_id, action, resource_row, reason, rule):
     return {
         "request_id": None, "decision": "BLOCK", "reason": reason, "rule": rule,
         "risk_score": None, "risk_level": None, "threat_type": None,
-        "executed": False, "tool_result": None,
+        "executed": False, "approval_required": False, "tool_result": None,
     }
 
 
 # ---------- The gateway ----------
 def handle_request(db: Session, agent_id: str, action: str, resource: str,
-                   destination: str = None, input_text: str = None) -> dict:
+                   destination: str = None, input_text: str = None,
+                   payload: dict = None) -> dict:
     """
     Every agent action goes through this function. Agents never call tools directly.
 
     agent_id    : must come from authentication, NOT from what the agent claims
-    action      : e.g. "READ_FILE"
+    action      : "READ_FILE", "READ_DATABASE", "WRITE_DATABASE", "SEND_EMAIL" or "EXPORT_DATA"
     resource    : resource name, e.g. "public_research.pdf"
     destination : where data is going (email address or location), if any
     input_text  : the instruction text the agent was working from, if any
+    payload     : optional tool data, e.g. {"record": ...} or {"subject": ..., "body": ...}
     """
+    payload = payload or {}
+
     # --- Step 0: identify the agent and the resource ---
     agent = db.query(Agent).filter(Agent.agent_id == agent_id).first()
     resource_row = db.query(Resource).filter(Resource.name == resource).first()
@@ -184,39 +199,47 @@ def handle_request(db: Session, agent_id: str, action: str, resource: str,
     # --- Step 7: final decision (precedence lives in decision_engine.PRECEDENCE) ---
     result = make_decision(permission_allowed, policy, risk, threat, behavior)
     final = result["decision"]
+    reason = result["reason"]
 
     # --- Save the risk result and any incident ---
     db.add(RiskEvent(
         request_id=request_id, risk_score=risk["risk_score"],
         risk_level=risk["risk_level"], factors=", ".join(risk["factors"]),
     ))
-    if threat["threat_detected"]:
+    for found in threat["threats"]:   # one incident row per detected threat
         db.add(SecurityIncident(
             request_id=request_id, agent_id=agent_id,
-            threat_type=threat["threat_type"], severity=threat["severity"],
-            description=threat["description"],
+            threat_type=found["threat_type"], severity=found["severity"],
+            description=found["description"],
         ))
     db.commit()
 
     # --- Audit log FIRST, so no action can ever run without a record ---
     log_action(db, request_id, agent_id, action, resource_row.resource_id,
-               risk["risk_score"], final, result["reason"])
+               risk["risk_score"], final, reason)
 
-    # --- Steps 8-11: act on the decision ---
+    # --- Step 8: act on the decision ---
     executed = False
+    approval_required = False
     tool_result = None
 
     if final == "ALLOW":
         action_request.status = "ALLOWED"
         db.commit()
-        tool_function = TOOLS.get(action)
-        if tool_function is not None:
-            tool_result = tool_function(resource, destination)
-            executed = True
+        runner = TOOL_RUNNERS.get(action)
+        if runner is None:
+            reason += " (no simulated tool is registered for this action)"
         else:
-            tool_result = "No simulated tool is registered for this action"
+            try:
+                tool_result = runner(resource, destination, payload)
+            except Exception as error:  # e.g. a bad payload; report it instead of crashing
+                tool_result = {"success": False, "error": str(error)}
+            executed = True
+
     elif final == "REVIEW":
         create_approval_request(db, request_id)   # sets status to REVIEW
+        approval_required = True                  # tool is NOT executed
+
     else:  # BLOCK: the tool is never touched
         action_request.status = "BLOCKED"
         db.commit()
@@ -224,11 +247,12 @@ def handle_request(db: Session, agent_id: str, action: str, resource: str,
     return {
         "request_id": request_id,
         "decision": final,
-        "reason": result["reason"],
+        "reason": reason,
         "rule": result["rule"],
         "risk_score": risk["risk_score"],
         "risk_level": risk["risk_level"],
         "threat_type": threat["threat_type"],
         "executed": executed,
-        "tool_result": tool_result,
+        "approval_required": approval_required,
+        "tool_result": tool_result,   # None unless the tool actually ran
     }
