@@ -214,9 +214,13 @@ def handle_request(db: Session, agent_id: str, action: str, resource: str,
         ))
     db.commit()
 
-    # --- Audit log FIRST, so no action can ever run without a record ---
+    # The decision reason names only the most severe threat, so list ALL of them here
+    audit_reason = reason
+    if threat["threats"]:
+        names = ", ".join(f"{t['threat_type']} ({t['severity']})" for t in threat["threats"])
+        audit_reason += f" | Threats detected: {names}"
     log_action(db, request_id, agent_id, action, resource_row.resource_id,
-               risk["risk_score"], final, reason)
+               risk["risk_score"], final, audit_reason)
 
     # --- Step 8: act on the decision ---
     executed = False
