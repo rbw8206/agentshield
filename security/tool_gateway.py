@@ -1,3 +1,4 @@
+import json
 import uuid
 
 from sqlalchemy.orm import Session
@@ -5,7 +6,7 @@ from sqlalchemy.orm import Session
 from agents import tools  # the ONLY place in the project that should import the tools
 from backend.models import (
     Agent, Resource, ActionRequest, AuditLog, RiskEvent, SecurityIncident,
-    Permission, AgentPermission, utc_now,
+    Permission, AgentPermission, PendingAction, utc_now,
 )
 from security.permissions import check_permission
 from security.policy_engine import evaluate_policy
@@ -13,7 +14,9 @@ from security.risk_engine import calculate_risk
 from security.threat_detection import detect_threat, ADMIN_ACTIONS
 from security.behavior_monitor import monitor_behavior
 from security.decision_engine import make_decision
-from security.approval import create_approval_request
+from security.approval import (
+    create_approval_request, log_workflow_event, ApprovalNotFound, WrongStatus,
+)
 from security.audit_logger import log_action
 
 
@@ -26,6 +29,8 @@ BULK_ACTIONS = {"EXPORT_DATA"}
 DATA_MOVING_ACTIONS = {"SEND_EMAIL", "EXPORT_DATA"}
 # How many past audit-log entries to analyze for behavior
 HISTORY_LIMIT = 50
+# Only these audit rows are real agent requests; approval/execution rows are not
+GATEWAY_DECISIONS = ("ALLOW", "REVIEW", "BLOCK")
 
 
 # ---------- Tool connections ----------
@@ -85,7 +90,7 @@ def load_history(db: Session, agent_id: str):
     resource_names = {r.resource_id: r.name for r in db.query(Resource).all()}
     rows = (
         db.query(AuditLog)
-        .filter(AuditLog.agent_id == agent_id)
+        .filter(AuditLog.agent_id == agent_id, AuditLog.decision.in_(GATEWAY_DECISIONS))
         .order_by(AuditLog.timestamp.desc(), AuditLog.log_id.desc())
         .limit(HISTORY_LIMIT)
         .all()
@@ -241,7 +246,10 @@ def handle_request(db: Session, agent_id: str, action: str, resource: str,
             executed = True
 
     elif final == "REVIEW":
-        create_approval_request(db, request_id)   # sets status to REVIEW
+        # Keep the parameters so the action can run later, but do NOT run it now
+        db.add(PendingAction(request_id=request_id, destination=destination,
+                             payload=json.dumps(payload, default=str)))
+        create_approval_request(db, request_id)   # sets status to REVIEW and saves
         approval_required = True                  # tool is NOT executed
 
     else:  # BLOCK: the tool is never touched
@@ -260,3 +268,50 @@ def handle_request(db: Session, agent_id: str, action: str, resource: str,
         "approval_required": approval_required,
         "tool_result": tool_result,   # None unless the tool actually ran
     }
+
+
+def execute_approved_request(db: Session, request_id: str) -> dict:
+    """
+    Run the simulated tool for a request an administrator has APPROVED.
+    Runs at most once: the request is claimed atomically (APPROVED -> EXECUTING),
+    so a second call, a rejected request or a request still in REVIEW is refused.
+    """
+    claimed = (
+        db.query(ActionRequest)
+        .filter(ActionRequest.request_id == request_id, ActionRequest.status == "APPROVED")
+        .update({"status": "EXECUTING"}, synchronize_session=False)
+    )
+    db.commit()
+
+    action_request = (
+        db.query(ActionRequest).filter(ActionRequest.request_id == request_id).first()
+    )
+    if action_request is None:
+        raise ApprovalNotFound(f"Action request '{request_id}' does not exist")
+    if claimed == 0:
+        raise WrongStatus(
+            f"Request '{request_id}' cannot be executed (status: {action_request.status})"
+        )
+
+    resource_row = db.query(Resource).filter(
+        Resource.resource_id == action_request.resource_id
+    ).first()
+    held = db.query(PendingAction).filter(PendingAction.request_id == request_id).first()
+    destination = held.destination if held else None
+    payload = json.loads(held.payload) if held and held.payload else {}
+
+    try:
+        runner = TOOL_RUNNERS.get(action_request.action)
+        if runner is None:
+            raise ValueError("No simulated tool is registered for this action")
+        tool_result = runner(resource_row.name, destination, payload)
+        outcome, reason = "EXECUTED", "Executed after administrator approval"
+    except Exception as error:   # report the failure; never run the tool a second time
+        tool_result = {"success": False, "error": str(error)}
+        outcome, reason = "EXECUTION_FAILED", f"Tool failed after approval: {error}"
+
+    action_request.status = outcome
+    db.commit()
+    log_workflow_event(db, action_request, outcome, reason)
+
+    return {"status": outcome, "executed": outcome == "EXECUTED", "tool_result": tool_result}

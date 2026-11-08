@@ -175,7 +175,14 @@ class SecurityIncident(Base):
     request = relationship("ActionRequest", back_populates="incidents")
     agent = relationship("Agent", back_populates="incidents")
 
+# Parameters of a REVIEW request, kept so the action can run after an admin approves it
+class PendingAction(Base):
+    __tablename__ = "pending_actions"
 
+    request_id = Column(String(50), ForeignKey("action_requests.request_id"), primary_key=True)
+    destination = Column(String(255))
+    payload = Column(Text)                     # JSON text
+    created_at = Column(DateTime, default=utc_now)
 # Create all tables when this file is run directly
 if __name__ == "__main__":
     Base.metadata.create_all(bind=engine)
