@@ -183,6 +183,16 @@ class PendingAction(Base):
     destination = Column(String(255))
     payload = Column(Text)                     # JSON text
     created_at = Column(DateTime, default=utc_now)
+# An API key lets an agent prove who it is. Only a hash of the key is stored, never the key itself.
+class AgentApiKey(Base):
+    __tablename__ = "agent_api_keys"
+
+    key_id = Column(Integer, primary_key=True, index=True)
+    agent_id = Column(String(50), ForeignKey("agents.agent_id"), nullable=False)
+    key_hash = Column(String(64), unique=True, nullable=False)   # SHA-256 of the key (hex)
+    label = Column(String(100))
+    revoked = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=utc_now)
 # Create all tables when this file is run directly
 if __name__ == "__main__":
     Base.metadata.create_all(bind=engine)
